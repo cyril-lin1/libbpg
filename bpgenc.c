@@ -33,6 +33,105 @@
 #include <jpeglib.h>
 
 #include "bpgenc.h"
+#include "psnr.h"
+#include "time-measure.h"
+
+static void png_write_data(png_structp png_ptr, png_bytep data,
+    png_size_t length)
+{
+    FILE* f;
+    int ret;
+
+    f = png_get_io_ptr(png_ptr);
+    ret = fwrite(data, 1, length, f);
+    if (ret != length)
+        png_error(png_ptr, "PNG Write Error");
+}
+
+static void png_save(BPGDecoderContext* img, const char* filename, int bit_depth)
+{
+    BPGImageInfo img_info_s, * img_info = &img_info_s;
+    FILE* f;
+    png_structp png_ptr;
+    png_infop info_ptr;
+    png_bytep row_pointer;
+    int y, color_type, bpp;
+    BPGDecoderOutputFormat out_fmt;
+
+    if (bit_depth != 8 && bit_depth != 16) {
+        fprintf(stderr, "Only bit_depth = 8 or 16 are supported for PNG output\n");
+        exit(1);
+    }
+
+    bpg_decoder_get_info(img, img_info);
+
+    f = fopen(filename, "wb");
+    if (!f) {
+        fprintf(stderr, "%s: I/O error\n", filename);
+        exit(1);
+    }
+
+    png_ptr = png_create_write_struct_2(PNG_LIBPNG_VER_STRING,
+        NULL,
+        NULL,  /* error */
+        NULL, /* warning */
+        NULL,
+        NULL,
+        NULL);
+    info_ptr = png_create_info_struct(png_ptr);
+    png_set_write_fn(png_ptr, (png_voidp)f, &png_write_data, NULL);
+
+    if (setjmp(png_jmpbuf(png_ptr)) != 0) {
+        fprintf(stderr, "PNG write error\n");
+        exit(1);
+    }
+
+    if (img_info->has_alpha)
+        color_type = PNG_COLOR_TYPE_RGB_ALPHA;
+    else
+        color_type = PNG_COLOR_TYPE_RGB;
+
+    png_set_IHDR(png_ptr, info_ptr, img_info->width, img_info->height,
+        bit_depth, color_type, PNG_INTERLACE_NONE,
+        PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
+
+    png_write_info(png_ptr, info_ptr);
+
+#if __BYTE_ORDER__ != __ORDER_BIG_ENDIAN__
+    if (bit_depth == 16) {
+        png_set_swap(png_ptr);
+    }
+#endif
+
+    if (bit_depth == 16) {
+        if (img_info->has_alpha)
+            out_fmt = BPG_OUTPUT_FORMAT_RGBA64;
+        else
+            out_fmt = BPG_OUTPUT_FORMAT_RGB48;
+    }
+    else {
+        if (img_info->has_alpha)
+            out_fmt = BPG_OUTPUT_FORMAT_RGBA32;
+        else
+            out_fmt = BPG_OUTPUT_FORMAT_RGB24;
+    }
+
+    bpg_decoder_start(img, out_fmt);
+
+    bpp = (3 + img_info->has_alpha) * (bit_depth / 8);
+    row_pointer = (png_bytep)png_malloc(png_ptr, img_info->width * bpp);
+    for (y = 0; y < img_info->height; y++) {
+        bpg_decoder_get_line(img, row_pointer);
+        png_write_row(png_ptr, row_pointer);
+    }
+    png_free(png_ptr, row_pointer);
+
+    png_write_end(png_ptr, NULL);
+
+    png_destroy_write_struct(&png_ptr, &info_ptr);
+
+    fclose(f);
+}
 
 typedef uint16_t PIXEL;
 
@@ -2200,6 +2299,7 @@ static HEVCEncoder *hevc_encoder_tab[HEVC_ENCODER_COUNT] = {
 #define IMAGE_HEADER_MAGIC 0x425047fb
 
 #define DEFAULT_OUTFILENAME "out.bpg"
+#define DEFAULT_OUTFILENAME_PNG "out.png"
 #define DEFAULT_QP 29
 #define DEFAULT_BIT_DEPTH 8
 
@@ -2704,12 +2804,13 @@ struct option long_opts[] = {
     { "loop", required_argument },
     { "fps", required_argument },
     { "delayfile", required_argument },
+    { "decodeoutputfile", required_argument},
     { NULL },
 };
 
 int main(int argc, char **argv)
 {
-    const char *infilename, *outfilename, *frame_delay_file;
+    const char *infilename, *outfilename, *frame_delay_file, *outfilename_png;
     Image *img;
     FILE *f;
     int c, option_index;
@@ -2719,6 +2820,7 @@ int main(int argc, char **argv)
     BPGMetaData *md;
     BPGEncoderContext *enc_ctx;
     BPGEncoderParameters *p;
+    TM_CTX tm_ctx;
 
     p = bpg_encoder_param_alloc();
 
@@ -2729,6 +2831,7 @@ int main(int argc, char **argv)
     limited_range = 0;
     premultiplied_alpha = 0;
     frame_delay_file = NULL;
+    outfilename_png = DEFAULT_OUTFILENAME_PNG;
     
     for(;;) {
         c = getopt_long_only(argc, argv, "q:o:hf:c:vm:b:e:a", long_opts, &option_index);
@@ -2776,6 +2879,10 @@ int main(int argc, char **argv)
                 break;
             case 8:
                 frame_delay_file = optarg;
+                break;
+            case 9:
+                /* decodeoutputfile */
+                outfilename_png = optarg;
                 break;
             default:
                 goto show_help;
@@ -2960,9 +3067,10 @@ int main(int argc, char **argv)
         }
         
         bpg_encoder_set_extension_data(enc_ctx, md);
-        
+
+        time_measure_general_start(&tm_ctx);
         bpg_encoder_encode(enc_ctx, img, my_write_func, f);
-        image_free(img);
+        time_measure_general_end(&tm_ctx, 0, "bpg_encoder_encode");
     }
 
     fclose(f);
@@ -2971,5 +3079,45 @@ int main(int argc, char **argv)
     
     bpg_encoder_param_free(p);
 
+
+    /* ½âÂë */
+    f = fopen(outfilename, "rb");
+    if (!f) {
+        fprintf(stderr, "Could not open %s\n", outfilename);
+        exit(1);
+    }
+
+    fseek(f, 0, SEEK_END);
+    int buf_len = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    uint8_t* buf = malloc(buf_len);
+    if (fread(buf, 1, buf_len, f) != buf_len) {
+        fprintf(stderr, "Error while reading file\n");
+        exit(1);
+    }
+
+    fclose(f);
+
+    BPGDecoderContext* dec_ctx = bpg_decoder_open();
+
+    time_measure_general_start(&tm_ctx);
+    if (bpg_decoder_decode(dec_ctx, buf, buf_len) < 0) {
+        fprintf(stderr, "Could not decode image\n");
+        exit(1);
+    }
+    time_measure_general_end(&tm_ctx, 0, "bpg_decoder_decode");
+    free(buf);
+
+    png_save(dec_ctx, outfilename_png, bit_depth);
+
+    /* psnr */
+    int y_linesize = 0;
+    uint8_t* dec_y_buf = bpg_decoder_get_data(dec_ctx, &y_linesize, 0);
+    float psnr = iqa_psnr(dec_y_buf, img->data[0], img->w, img->h, img->w);
+    printf("buf_len=%d kb, psnr=%.2f\n", buf_len * 8 / 1000, psnr);
+
+    bpg_decoder_close(dec_ctx);
+    image_free(img);
     return 0;
 }

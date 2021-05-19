@@ -9,7 +9,7 @@ USE_X265=y
 # Enable the JCTVC code (best quality but slow) for the encoder
 #USE_JCTVC=y
 # Compile bpgview (SDL and SDL_image libraries needed)
-USE_BPGVIEW=y
+#USE_BPGVIEW=y
 # Enable it to use bit depths > 12 (need more tests to validate encoder)
 #USE_JCTVC_HIGH_BIT_DEPTH=y
 # Enable the cross compilation for Windows
@@ -166,8 +166,8 @@ endif # USE_JCTVC
 
 ifdef CONFIG_WIN32
 
-BPGDEC_LIBS:=-lpng -lz
-BPGENC_LIBS+=-lpng -ljpeg -lz
+BPGDEC_LIBS:=-lpng15 -lz
+BPGENC_LIBS+=-lpng15 -ljpeg -lz
 BPGVIEW_LIBS:=-lmingw32 -lSDLmain -lSDL_image -lSDL -mwindows
 
 else
@@ -179,8 +179,8 @@ LIBS:=-lrt
 endif # !CONFIG_APPLE 
 LIBS+=-lm -lpthread
 
-BPGDEC_LIBS:=-lpng $(LIBS)
-BPGENC_LIBS+=-lpng -ljpeg $(LIBS)
+BPGDEC_LIBS:=-lpng15 $(LIBS)
+BPGENC_LIBS+=-lpng15 -ljpeg $(LIBS)
 BPGVIEW_LIBS:=-lSDL_image -lSDL $(LIBS)
 
 endif #!CONFIG_WIN32
@@ -193,7 +193,8 @@ libbpg.a: $(LIBBPG_OBJS)
 bpgdec$(EXE): bpgdec.o libbpg.a
 	$(CC) $(LDFLAGS) -o $@ $^ $(BPGDEC_LIBS)
 
-bpgenc$(EXE): $(BPGENC_OBJS)
+BPGENC_OBJS+=psnr.o time-measure.o
+bpgenc$(EXE): $(BPGENC_OBJS) libbpg.a
 	$(CXX) $(LDFLAGS) -o $@ $^ $(BPGENC_LIBS)
 
 bpgview$(EXE): bpgview.o libbpg.a
